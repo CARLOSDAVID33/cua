@@ -56,6 +56,87 @@ pub fn publish_window(
     )
 }
 
+/// Hyprland desktop frame each desktop capture was taken of. Capture admission
+/// otherwise compares only dimensions, which two different monitor layouts of
+/// equal size (for example either of two equal monitors on its own) share.
+#[cfg(target_os = "linux")]
+static DESKTOP_CAPTURE_FRAMES: std::sync::Mutex<
+    std::collections::VecDeque<(String, crate::wayland::hyprland::DesktopFrame)>,
+> = std::sync::Mutex::new(std::collections::VecDeque::new());
+
+#[cfg(target_os = "linux")]
+const REMEMBERED_DESKTOP_CAPTURES: usize = 64;
+
+#[cfg(target_os = "linux")]
+pub fn remember_desktop_frame(capture_id: &str, frame: crate::wayland::hyprland::DesktopFrame) {
+    let mut frames = DESKTOP_CAPTURE_FRAMES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    frames.retain(|(id, _)| id != capture_id);
+    if frames.len() >= REMEMBERED_DESKTOP_CAPTURES {
+        frames.pop_front();
+    }
+    frames.push_back((capture_id.to_owned(), frame));
+}
+
+/// Refuse a desktop capture taken of a different monitor layout than
+/// `current`, before admission consumes it. A capture with no recorded frame is
+/// left to admission, so an unknown, expired or window capture keeps its own
+/// refusal code. Off Hyprland (`current` is `None`) there is nothing to compare.
+#[cfg(target_os = "linux")]
+pub fn check_desktop_frame(
+    capture_id: &str,
+    current: Option<&crate::wayland::hyprland::DesktopFrame>,
+) -> anyhow::Result<()> {
+    let Some(current) = current else {
+        return Ok(());
+    };
+    let frames = DESKTOP_CAPTURE_FRAMES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    match frames.iter().find(|(id, _)| id == capture_id) {
+        Some((_, frame)) if frame != current => Err(desktop_frame_mismatch(
+            capture_id,
+            "was taken of a different monitor layout",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Forget the frame of a desktop capture that admission has just consumed. On
+/// Hyprland, an admitted capture whose frame is no longer recorded (the table
+/// is bounded) cannot be checked against `current`, so it is refused.
+#[cfg(target_os = "linux")]
+pub fn release_desktop_frame(
+    capture_id: &str,
+    current: Option<&crate::wayland::hyprland::DesktopFrame>,
+) -> anyhow::Result<()> {
+    let mut frames = DESKTOP_CAPTURE_FRAMES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let recorded = frames.iter().position(|(id, _)| id == capture_id);
+    if let Some(index) = recorded {
+        frames.remove(index);
+    }
+    if current.is_some() && recorded.is_none() {
+        return Err(desktop_frame_mismatch(
+            capture_id,
+            "has no recorded Hyprland desktop frame",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_frame_mismatch(capture_id: &str, reason: &str) -> anyhow::Error {
+    anyhow::Error::new(
+        cua_driver_core::capture_runtime::CaptureActionError::NativeActionFrameMismatch,
+    )
+    .context(format!(
+        "capture {capture_id} {reason}; call get_desktop_state again"
+    ))
+}
+
 pub fn publish_desktop(
     service: &CaptureService,
     args: &Value,
@@ -237,6 +318,100 @@ mod tests {
     use super::*;
     use cua_driver_core::capture_runtime::admission_error_code;
     use sha2::{Digest, Sha256};
+
+    #[cfg(target_os = "linux")]
+    fn frame_at(x: i32) -> crate::wayland::hyprland::DesktopFrame {
+        crate::wayland::hyprland::DesktopFrame {
+            x,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            scale: 1.0,
+            outputs: Vec::new(),
+        }
+    }
+
+    /// Serializes the tests that share the process-wide frame table, so the
+    /// bounded-table test cannot evict another test's records.
+    #[cfg(target_os = "linux")]
+    static FRAME_TABLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_desktop_capture_of_another_layout_is_refused_without_being_consumed() {
+        let _table = FRAME_TABLE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let service = CaptureService::default();
+        let call_args = args("desktop-frame");
+        let id = publish_desktop(&service, &call_args, &png(4, 3, 0x51), (4, 3), (4, 3)).unwrap();
+        remember_desktop_frame(&id, frame_at(-1920));
+
+        // Same size, different monitor: refused with the frame code.
+        let refusal = check_desktop_frame(&id, Some(&frame_at(0))).unwrap_err();
+        assert_eq!(admission_error_code(&refusal), "capture_frame_mismatch");
+        assert!(
+            refusal.to_string().contains("different monitor layout"),
+            "{refusal}"
+        );
+        // The refused capture was not consumed: its own layout still admits it.
+        check_desktop_frame(&id, Some(&frame_at(-1920))).unwrap();
+        assert_eq!(
+            admit_desktop(&service, &call_args, &id, (2.0, 1.0), (4, 3)).unwrap(),
+            (2.0, 1.0)
+        );
+        release_desktop_frame(&id, Some(&frame_at(-1920))).unwrap();
+        // Off Hyprland there is no frame to bind.
+        check_desktop_frame(&id, None).unwrap();
+        release_desktop_frame(&id, None).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unrecorded_desktop_captures_keep_their_admission_codes() {
+        let _table = FRAME_TABLE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let service = CaptureService::default();
+        let call_args = args("desktop-frame-codes");
+        let current = frame_at(0);
+        let refused = |id: &str| {
+            check_desktop_frame(id, Some(&current)).unwrap();
+            let refusal = admit_desktop(&service, &call_args, id, (1.0, 1.0), (4, 3)).unwrap_err();
+            admission_error_code(&refusal)
+        };
+
+        assert_eq!(refused("not-a-capture"), "capture_id_invalid");
+        let window =
+            publish_window(&service, &call_args, &png(4, 3, 0x52), 5, 6, (4, 3), (4, 3)).unwrap();
+        assert_eq!(refused(&window), "capture_target_mismatch");
+        let used = publish_desktop(&service, &call_args, &png(4, 3, 0x53), (4, 3), (4, 3)).unwrap();
+        admit_desktop(&service, &call_args, &used, (1.0, 1.0), (4, 3)).unwrap();
+        assert_eq!(refused(&used), "capture_not_found");
+
+        // A desktop capture admitted with no recorded frame cannot be checked.
+        let unrecorded =
+            publish_desktop(&service, &call_args, &png(4, 3, 0x54), (4, 3), (4, 3)).unwrap();
+        check_desktop_frame(&unrecorded, Some(&current)).unwrap();
+        admit_desktop(&service, &call_args, &unrecorded, (1.0, 1.0), (4, 3)).unwrap();
+        let refusal = release_desktop_frame(&unrecorded, Some(&current)).unwrap_err();
+        assert_eq!(admission_error_code(&refusal), "capture_frame_mismatch");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_desktop_frame_table_forgets_the_oldest_captures() {
+        let _table = FRAME_TABLE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        for i in 0..(REMEMBERED_DESKTOP_CAPTURES + 5) {
+            remember_desktop_frame(&format!("bounded-{i}"), frame_at(0));
+        }
+        assert!(release_desktop_frame("bounded-0", Some(&frame_at(0))).is_err());
+        for i in 5..(REMEMBERED_DESKTOP_CAPTURES + 5) {
+            release_desktop_frame(&format!("bounded-{i}"), Some(&frame_at(0))).unwrap();
+        }
+    }
 
     fn png(width: u32, height: u32, value: u8) -> Vec<u8> {
         let rgba = vec![value; (width * height * 4) as usize];
