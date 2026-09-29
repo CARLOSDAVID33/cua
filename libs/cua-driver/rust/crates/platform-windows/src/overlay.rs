@@ -296,7 +296,7 @@ pub fn is_visible_for_session(key: &str) -> bool {
                     rs.core.cfg.enabled
                         && rs.core.visible
                         && rs.core.idle_alpha >= 0.004
-                        && rs.core.pos.0 >= -100.0
+                        && cursor_overlay::render_state::is_placed(rs.core.pos)
                 })
         })
         .unwrap_or(false)
@@ -343,7 +343,7 @@ pub fn current_position(key: &str) -> (f64, f64) {
                 .and_then(|m| m.cursors.get(key))
                 .map(|rs| rs.core.pos)
         })
-        .unwrap_or((-200.0, -200.0))
+        .unwrap_or(cursor_overlay::render_state::UNPLACED_POS)
 }
 
 /// Seed a brand-new (sentinel-positioned) cursor at an on-screen start point
@@ -382,7 +382,11 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
     let should_animate = {
         let guard = RENDER.lock().unwrap();
         match guard.as_ref().and_then(|m| m.cursors.get(&key)) {
-            Some(rs) if rs.core.cfg.enabled && rs.core.pos.0 > -50.0 => true,
+            Some(rs)
+                if rs.core.cfg.enabled && cursor_overlay::render_state::is_placed(rs.core.pos) =>
+            {
+                true
+            }
             _ => false,
         }
     };
@@ -492,7 +496,7 @@ impl RenderState {
             && self.core.click_t.is_none()
             && self.core.motion.idle_hide_ms > 0.0
             && self.core.visible
-            && self.core.pos.0 >= -100.0
+            && cursor_overlay::render_state::is_placed(self.core.pos)
             && self.core.idle_alpha >= 1.0
     }
 }
@@ -868,7 +872,10 @@ fn composite_dirty(map: &RenderMap) -> Option<DirtyRect> {
         // (mirrors paint_cursor's own visibility early-return).
         let mut current: Option<DirtyRect> = None;
         for rs in map.cursors.values() {
-            if !rs.core.visible || rs.core.pos.0 < -100.0 || rs.core.idle_alpha < 0.004 {
+            if !rs.core.visible
+                || !cursor_overlay::render_state::is_placed(rs.core.pos)
+                || rs.core.idle_alpha < 0.004
+            {
                 continue;
             }
             let cx = (rs.core.pos.0 - screen.virt_x as f64).round() as i32;

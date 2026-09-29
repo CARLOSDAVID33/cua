@@ -132,6 +132,8 @@ fn cursor_may_paint(state: &RenderState) -> bool {
         || (state.core.cfg.enabled
             && state.core.visible
             && state.core.idle_alpha > 0.0
+            // The macOS overlay paints only the main screen from (0, 0), so a
+            // cursor placed at negative X paints nothing here.
             && state.core.pos.0 > -50.0
             && state.core.pos.1 > -50.0)
 }
@@ -318,7 +320,7 @@ pub fn current_theme_state(
 /// the sentinel and only `ClickPulse` snapped a static arrow, which is easy to
 /// miss. See the AX-no-glide report.
 ///
-/// No-op when the cursor is already on-screen (pos.0 > -50.0) or absent. The
+/// No-op when the cursor is already placed (`is_placed`) or absent. The
 /// seed is clamped to the main screen frame so it never starts off-display.
 /// Returns true if a seed was applied (i.e. the cursor was at the sentinel and
 /// is now primed to glide).
@@ -349,7 +351,7 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
         return;
     }
     // Seed a sentinel cursor on-screen so the MoveTo below glides instead of
-    // being short-circuited. After this the cursor's pos.0 > -50.0, so the
+    // being short-circuited. After this the cursor is placed (`is_placed`), so the
     // should-animate check passes on the first action just like later ones.
     seed_start_if_sentinel(&key, x, y);
 
@@ -359,7 +361,7 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
         let guard = RENDER.lock().unwrap();
         matches!(
             guard.as_ref().and_then(|m| m.cursors.get(&key)),
-            Some(rs) if rs.core.cfg.enabled && rs.core.pos.0 > -50.0
+            Some(rs) if rs.core.cfg.enabled && cursor_overlay::render_state::is_placed(rs.core.pos)
         )
     };
     if !should_animate {
@@ -529,7 +531,7 @@ impl RenderEntry for RenderState {
             || self.focus_rect.is_some()
             || (self.core.motion.idle_hide_ms > 0.0
                 && self.core.visible
-                && self.core.pos.0 >= -100.0
+                && cursor_overlay::render_state::is_placed(self.core.pos)
                 && self.core.idle_alpha >= 0.004)
     }
 }
@@ -898,6 +900,7 @@ fn hardware_cursor_position() -> Option<(f64, f64)> {
 fn cursor_is_externally_visible(state: &RenderState) -> bool {
     state.core.cfg.enabled
         && state.core.visible
+        // Visible means painted on the main-screen overlay, which starts at (0, 0).
         && state.core.pos.0 > -50.0
         && state.core.pos.1 > -50.0
         && state.core.idle_alpha >= 0.004
