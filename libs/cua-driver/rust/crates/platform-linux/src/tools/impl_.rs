@@ -6172,27 +6172,17 @@ impl Tool for ClickTool {
                 crate::wayland::DesktopInputSpace::default()
             };
             let (action_x, action_y) = if let Some(capture_id) = args.opt_str("capture_id") {
-                if let Err(error) =
-                    crate::capture_action_frame::check_desktop_frame(&capture_id, space.frame())
-                {
-                    return capture_admission_error(error);
-                }
-                let point = match crate::capture_action_frame::admit_desktop_click(
+                match crate::capture_action_frame::admit_desktop_click_in_frame(
                     &self.state.capture_service,
                     &args,
                     &capture_id,
+                    space.frame(),
                     input.x,
                     input.y,
                 ) {
                     Ok(point) => point,
                     Err(error) => return capture_admission_error(error),
-                };
-                if let Err(error) =
-                    crate::capture_action_frame::release_desktop_frame(&capture_id, space.frame())
-                {
-                    return capture_admission_error(error);
                 }
-                point
             } else {
                 (input.x, input.y)
             };
@@ -12263,7 +12253,7 @@ impl Tool for GetDesktopStateTool {
                 (screen_w, screen_h),
             )?;
             if let Some(frame) = hyprland_frame {
-                crate::capture_action_frame::remember_desktop_frame(&capture_id, frame);
+                crate::capture_action_frame::remember_desktop_frame(&capture_id, frame)?;
             }
             Ok((
                 b64,

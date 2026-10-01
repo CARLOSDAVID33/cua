@@ -1302,6 +1302,102 @@ impl VptrSession {
     }
 }
 
+/// One virtual-pointer event of a scroll or drag sequence, in
+/// `motion_absolute` coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PointerEvent {
+    Motion(u32, u32),
+    Button(u32, ButtonState),
+    Tick(Axis, f64, i32),
+}
+
+/// Where [`drive_drag`] and [`drive_scroll`] send their events. Each event is
+/// flushed to the compositor before the next wait.
+trait PointerSink {
+    /// See [`VptrSession::ensure_layout`].
+    fn ensure_layout(&self) -> anyhow::Result<()>;
+    fn send(&mut self, event: PointerEvent) -> anyhow::Result<()>;
+    fn wait(&mut self, millis: u64);
+}
+
+impl PointerSink for VptrSession {
+    fn ensure_layout(&self) -> anyhow::Result<()> {
+        VptrSession::ensure_layout(self)
+    }
+
+    fn send(&mut self, event: PointerEvent) -> anyhow::Result<()> {
+        match event {
+            PointerEvent::Motion(x, y) => {
+                self.vptr
+                    .motion_absolute(event_time_ms(), x, y, self.output_w, self.output_h)
+            }
+            PointerEvent::Button(button, state) => self.vptr.button(event_time_ms(), button, state),
+            PointerEvent::Tick(axis, value, discrete) => {
+                self.vptr.axis_source(AxisSource::Wheel);
+                self.vptr
+                    .axis_discrete(event_time_ms(), axis, value, discrete);
+            }
+        }
+        self.vptr.frame();
+        self.queue.roundtrip(&mut self.state)?;
+        Ok(())
+    }
+
+    fn wait(&mut self, millis: u64) {
+        std::thread::sleep(std::time::Duration::from_millis(millis));
+    }
+}
+
+/// Press `button` at `from`, move through `path` and release. The layout is
+/// checked immediately before every motion and the press, after each wait. A
+/// layout change once the button is down releases it where the pointer is and
+/// refuses the rest of the drag.
+fn drive_drag(
+    sink: &mut impl PointerSink,
+    from: (u32, u32),
+    path: impl IntoIterator<Item = (u32, u32)>,
+    button: u32,
+) -> anyhow::Result<()> {
+    sink.ensure_layout()?;
+    sink.send(PointerEvent::Motion(from.0, from.1))?;
+    sink.wait(15);
+    sink.ensure_layout()?;
+    sink.send(PointerEvent::Button(button, ButtonState::Pressed))?;
+    let mut moved = Ok(());
+    for (step, (x, y)) in path.into_iter().enumerate() {
+        if step > 0 {
+            sink.wait(8);
+        }
+        moved = sink
+            .ensure_layout()
+            .and_then(|()| sink.send(PointerEvent::Motion(x, y)));
+        if moved.is_err() {
+            break;
+        }
+    }
+    let released = sink.send(PointerEvent::Button(button, ButtonState::Released));
+    moved.and(released)
+}
+
+/// Send `amount` (at least one) wheel ticks, checking the layout immediately
+/// before each tick, after each wait.
+fn drive_scroll(
+    sink: &mut impl PointerSink,
+    amount: u32,
+    axis: Axis,
+    value: f64,
+    discrete: i32,
+) -> anyhow::Result<()> {
+    for i in 0..amount.max(1) {
+        if i > 0 {
+            sink.wait(25);
+        }
+        sink.ensure_layout()?;
+        sink.send(PointerEvent::Tick(axis, value, discrete))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn pointer_abs(
     origin_x: i32,
     origin_y: i32,
@@ -1930,16 +2026,7 @@ fn scroll_vptr(
     // axis_discrete: `value` is logical units (the wayland-rs wrapper
     // converts to wl_fixed internally); `discrete` is the tick count.
     let value: f64 = (sign as f64) * 10.0;
-    sess.ensure_layout()?;
-    for i in 0..amount.max(1) {
-        if i > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-        sess.vptr.axis_source(AxisSource::Wheel);
-        sess.vptr.axis_discrete(event_time_ms(), axis, value, sign);
-        sess.vptr.frame();
-        sess.queue.roundtrip(&mut sess.state)?;
-    }
+    drive_scroll(&mut sess, amount, axis, value, sign)?;
     sess.vptr.destroy();
     sess.queue.roundtrip(&mut sess.state)?;
     Ok(())
@@ -2102,38 +2189,20 @@ fn drag_vptr(
     let btn = evdev_pointer_button(button);
     let (origin_x, origin_y) = (sess.origin_x, sess.origin_y);
     let clamp_xy = |x: i32, y: i32| pointer_abs(origin_x, origin_y, w, h, x, y);
-    let (fx, fy) = clamp_xy(from_x, from_y);
-    sess.ensure_layout()?;
-    sess.vptr.motion_absolute(event_time_ms(), fx, fy, w, h);
-    sess.vptr.frame();
-    sess.queue.roundtrip(&mut sess.state)?;
-    std::thread::sleep(std::time::Duration::from_millis(15));
-    sess.ensure_layout()?;
-    sess.vptr.button(event_time_ms(), btn, ButtonState::Pressed);
-    sess.vptr.frame();
-    sess.queue.roundtrip(&mut sess.state)?;
     let n = steps.max(1);
-    for s in 1..=n {
-        let t = s as f64 / n as f64;
-        let ix = (from_x as f64 + (to_x - from_x) as f64 * t).round() as i32;
-        let iy = (from_y as f64 + (to_y - from_y) as f64 * t).round() as i32;
-        let (cx, cy) = clamp_xy(ix, iy);
-        sess.vptr.motion_absolute(event_time_ms(), cx, cy, w, h);
-        sess.vptr.frame();
-        sess.queue.roundtrip(&mut sess.state)?;
-        std::thread::sleep(std::time::Duration::from_millis(8));
-    }
+    let path = (1..=n)
+        .map(|s| {
+            let t = s as f64 / n as f64;
+            let ix = (from_x as f64 + (to_x - from_x) as f64 * t).round() as i32;
+            let iy = (from_y as f64 + (to_y - from_y) as f64 * t).round() as i32;
+            clamp_xy(ix, iy)
+        })
+        .chain(std::iter::once(clamp_xy(to_x, to_y)));
+    drive_drag(&mut sess, clamp_xy(from_x, from_y), path, btn)?;
     let (tx, ty) = clamp_xy(to_x, to_y);
-    sess.vptr.motion_absolute(event_time_ms(), tx, ty, w, h);
-    sess.vptr.frame();
-    sess.queue.roundtrip(&mut sess.state)?;
-    sess.vptr
-        .button(event_time_ms(), btn, ButtonState::Released);
-    sess.vptr.frame();
     // Sync the synthetic-cursor registry with the drag endpoint so a
     // subsequent `get_cursor_position` reports where we left the pointer.
     record_synth_cursor(origin_x + tx as i32, origin_y + ty as i32);
-    sess.queue.roundtrip(&mut sess.state)?;
     sess.vptr.destroy();
     sess.queue.roundtrip(&mut sess.state)?;
     Ok(())
@@ -3695,6 +3764,105 @@ const _BTN_LEFT_ALIAS: u32 = BTN_LEFT;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Records pointer events; its layout check refuses from the
+    /// `refuse_at`-th call on, as if the monitors changed during that wait.
+    struct FakeSink {
+        checks: std::cell::Cell<usize>,
+        refuse_at: usize,
+        events: Vec<PointerEvent>,
+    }
+
+    impl FakeSink {
+        fn refusing_at(refuse_at: usize) -> Self {
+            Self {
+                checks: std::cell::Cell::new(0),
+                refuse_at,
+                events: Vec::new(),
+            }
+        }
+    }
+
+    impl PointerSink for FakeSink {
+        fn ensure_layout(&self) -> anyhow::Result<()> {
+            let check = self.checks.get() + 1;
+            self.checks.set(check);
+            anyhow::ensure!(check < self.refuse_at, "layout changed");
+            Ok(())
+        }
+
+        fn send(&mut self, event: PointerEvent) -> anyhow::Result<()> {
+            self.events.push(event);
+            Ok(())
+        }
+
+        fn wait(&mut self, _millis: u64) {}
+    }
+
+    const BTN: u32 = 0x110;
+
+    #[test]
+    fn a_drag_checks_the_layout_before_every_motion_and_the_press() {
+        let path = [(2, 2), (3, 3), (4, 4)];
+        let mut sink = FakeSink::refusing_at(usize::MAX);
+        drive_drag(&mut sink, (1, 1), path, BTN).unwrap();
+        // Start motion, press, then one check per path motion.
+        assert_eq!(sink.checks.get(), 2 + path.len());
+        assert_eq!(
+            sink.events,
+            [
+                PointerEvent::Motion(1, 1),
+                PointerEvent::Button(BTN, ButtonState::Pressed),
+                PointerEvent::Motion(2, 2),
+                PointerEvent::Motion(3, 3),
+                PointerEvent::Motion(4, 4),
+                PointerEvent::Button(BTN, ButtonState::Released),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_layout_change_mid_drag_releases_the_button_and_stops() {
+        // Checks 1-2 precede the press; check 4 precedes the second motion.
+        let mut sink = FakeSink::refusing_at(4);
+        let error = drive_drag(&mut sink, (1, 1), [(2, 2), (3, 3), (4, 4)], BTN).unwrap_err();
+        assert_eq!(error.to_string(), "layout changed");
+        assert_eq!(
+            sink.events,
+            [
+                PointerEvent::Motion(1, 1),
+                PointerEvent::Button(BTN, ButtonState::Pressed),
+                PointerEvent::Motion(2, 2),
+                PointerEvent::Button(BTN, ButtonState::Released),
+            ]
+        );
+
+        // The final endpoint motion (check 4 here) is checked too.
+        let mut sink = FakeSink::refusing_at(4);
+        drive_drag(&mut sink, (1, 1), [(2, 2), (4, 4)], BTN).unwrap_err();
+        assert_eq!(
+            sink.events.last(),
+            Some(&PointerEvent::Button(BTN, ButtonState::Released))
+        );
+        assert!(!sink.events.contains(&PointerEvent::Motion(4, 4)));
+
+        // A change before the press sends no button at all.
+        let mut sink = FakeSink::refusing_at(2);
+        drive_drag(&mut sink, (1, 1), [(2, 2)], BTN).unwrap_err();
+        assert_eq!(sink.events, [PointerEvent::Motion(1, 1)]);
+    }
+
+    #[test]
+    fn a_layout_change_between_scroll_ticks_stops_the_scroll() {
+        let tick = PointerEvent::Tick(Axis::VerticalScroll, 10.0, 1);
+        let mut sink = FakeSink::refusing_at(usize::MAX);
+        drive_scroll(&mut sink, 3, Axis::VerticalScroll, 10.0, 1).unwrap();
+        assert_eq!(sink.events, [tick; 3]);
+
+        let mut sink = FakeSink::refusing_at(3);
+        drive_scroll(&mut sink, 5, Axis::VerticalScroll, 10.0, 1).unwrap_err();
+        assert_eq!(sink.events, [tick; 2]);
+    }
 
     fn window(xid: u64, pid: Option<u32>, title: &str) -> WindowInfo {
         WindowInfo {
