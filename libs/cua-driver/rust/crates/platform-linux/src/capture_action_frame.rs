@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use cua_driver_core::capture_runtime::{CaptureActionError, CaptureId};
 use cua_driver_core::capture_runtime::{
     CaptureActionRequest, CapturePublication, CaptureService, CaptureTarget,
     EncodedScreenshotDimensions, NativeActionDimensions, ScreenshotToActionTransform,
@@ -54,6 +56,112 @@ pub fn publish_window(
         native_action_dimensions,
         scaled_transform(encoded_dimensions, native_action_dimensions)?,
     )
+}
+
+/// Hyprland desktop frame each desktop capture was taken of. Capture admission
+/// otherwise compares only dimensions, which two different monitor layouts of
+/// equal size (for example either of two equal monitors on its own) share.
+/// Keyed by the parsed ID, so any accepted spelling of an ID finds its frame.
+#[cfg(target_os = "linux")]
+static DESKTOP_CAPTURE_FRAMES: std::sync::Mutex<
+    std::collections::VecDeque<(CaptureId, crate::wayland::hyprland::DesktopFrame)>,
+> = std::sync::Mutex::new(std::collections::VecDeque::new());
+
+#[cfg(target_os = "linux")]
+const REMEMBERED_DESKTOP_CAPTURES: usize = 64;
+
+#[cfg(target_os = "linux")]
+fn desktop_capture_frames() -> std::sync::MutexGuard<
+    'static,
+    std::collections::VecDeque<(CaptureId, crate::wayland::hyprland::DesktopFrame)>,
+> {
+    DESKTOP_CAPTURE_FRAMES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+#[cfg(target_os = "linux")]
+pub fn remember_desktop_frame(
+    capture_id: &str,
+    frame: crate::wayland::hyprland::DesktopFrame,
+) -> anyhow::Result<()> {
+    let capture_id: CaptureId = capture_id.parse()?;
+    let mut frames = desktop_capture_frames();
+    frames.retain(|(id, _)| *id != capture_id);
+    if frames.len() >= REMEMBERED_DESKTOP_CAPTURES {
+        frames.pop_front();
+    }
+    frames.push_back((capture_id, frame));
+    Ok(())
+}
+
+/// Admit a desktop click addressed in the Hyprland desktop frame `current`.
+///
+/// The capture is looked up without being consumed first, so an invalid,
+/// unknown, expired or other-session ID keeps its own refusal code. A desktop
+/// capture taken of a different monitor layout than `current`, or whose frame
+/// is no longer recorded, is then refused with `capture_frame_mismatch` and
+/// stays unconsumed. Admission compares the capture against `current`'s own
+/// dimensions, so the whole action uses one compositor snapshot. Off Hyprland
+/// (`current` is `None`) this is [`admit_desktop_click`].
+#[cfg(target_os = "linux")]
+pub fn admit_desktop_click_in_frame(
+    service: &CaptureService,
+    args: &Value,
+    capture_id: &str,
+    current: Option<&crate::wayland::hyprland::DesktopFrame>,
+    screenshot_x: f64,
+    screenshot_y: f64,
+) -> anyhow::Result<(f64, f64)> {
+    let Some(current) = current else {
+        return admit_desktop_click(service, args, capture_id, screenshot_x, screenshot_y);
+    };
+    let binding = service.binding_from_args(args)?;
+    let id = service.parse_capture_id(capture_id)?;
+    let capture = service
+        .read_for_perception(id, &binding)
+        .map_err(CaptureActionError::from)?;
+    // A window capture is refused by admission with its target code.
+    if *capture.target() == CaptureTarget::PrimaryDesktop {
+        let recorded = desktop_capture_frames()
+            .iter()
+            .find(|(recorded, _)| *recorded == id)
+            .map(|(_, frame)| frame.clone());
+        match recorded {
+            Some(frame) if frame == *current => {}
+            Some(_) => {
+                return Err(desktop_frame_mismatch(
+                    id,
+                    "was taken of a different monitor layout",
+                ))
+            }
+            None => {
+                return Err(desktop_frame_mismatch(
+                    id,
+                    "has no recorded Hyprland desktop frame",
+                ))
+            }
+        }
+    }
+    let point = admit_with_live_dimensions(
+        service,
+        args,
+        capture_id,
+        CaptureTarget::PrimaryDesktop,
+        NativeActionDimensions::new(current.width, current.height)?,
+        screenshot_x,
+        screenshot_y,
+    )?;
+    // Admission consumed the capture; its frame is no longer needed.
+    desktop_capture_frames().retain(|(recorded, _)| *recorded != id);
+    Ok(point)
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_frame_mismatch(capture_id: CaptureId, reason: &str) -> anyhow::Error {
+    anyhow::Error::new(CaptureActionError::NativeActionFrameMismatch).context(format!(
+        "capture {capture_id} {reason}; call get_desktop_state again"
+    ))
 }
 
 pub fn publish_desktop(
@@ -237,6 +345,210 @@ mod tests {
     use super::*;
     use cua_driver_core::capture_runtime::admission_error_code;
     use sha2::{Digest, Sha256};
+
+    #[cfg(target_os = "linux")]
+    fn frame_at(x: i32) -> crate::wayland::hyprland::DesktopFrame {
+        crate::wayland::hyprland::DesktopFrame {
+            x,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            scale: 1.0,
+            outputs: Vec::new(),
+        }
+    }
+
+    /// Serializes the tests that share the process-wide frame table, so the
+    /// bounded-table test cannot evict another test's records.
+    #[cfg(target_os = "linux")]
+    static FRAME_TABLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(target_os = "linux")]
+    fn admit_in(
+        service: &CaptureService,
+        args: &Value,
+        capture_id: &str,
+        frame: &crate::wayland::hyprland::DesktopFrame,
+    ) -> anyhow::Result<(f64, f64)> {
+        admit_desktop_click_in_frame(service, args, capture_id, Some(frame), 2.0, 1.0)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn refusal_code(result: anyhow::Result<(f64, f64)>) -> &'static str {
+        admission_error_code(&result.expect_err("admission must refuse"))
+    }
+
+    /// Publishes a Hyprland desktop capture of `frame` the way
+    /// `get_desktop_state` does: the capture's action frame is the frame's size.
+    #[cfg(target_os = "linux")]
+    fn publish_in(
+        service: &CaptureService,
+        args: &Value,
+        frame: &crate::wayland::hyprland::DesktopFrame,
+    ) -> String {
+        let size = (frame.width, frame.height);
+        let id = publish_desktop(service, args, &png(4, 3, 0x51), (4, 3), size).unwrap();
+        remember_desktop_frame(&id, frame.clone()).unwrap();
+        id
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_desktop_capture_of_another_layout_is_refused_without_being_consumed() {
+        let _table = FRAME_TABLE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let service = CaptureService::default();
+        let call_args = args("desktop-frame");
+        let id = publish_in(&service, &call_args, &frame_at(-1920));
+
+        // Same size, different monitor: refused with the frame code.
+        let refusal = admit_in(&service, &call_args, &id, &frame_at(0)).unwrap_err();
+        assert_eq!(admission_error_code(&refusal), "capture_frame_mismatch");
+        assert!(
+            refusal.to_string().contains("different monitor layout"),
+            "{refusal}"
+        );
+        // The refused capture was not consumed: its own layout still admits it,
+        // mapped through the frame's size (1920x1080 over a 4x3 screenshot).
+        assert_eq!(
+            admit_in(&service, &call_args, &id, &frame_at(-1920)).unwrap(),
+            (960.0, 360.0)
+        );
+        // Admission consumed it and forgot its frame.
+        assert_eq!(
+            refusal_code(admit_in(&service, &call_args, &id, &frame_at(-1920))),
+            "capture_not_found"
+        );
+        assert!(desktop_capture_frames()
+            .iter()
+            .all(|(recorded, _)| recorded.to_string() != id));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn any_accepted_spelling_of_an_id_finds_its_frame() {
+        let _table = FRAME_TABLE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let service = CaptureService::default();
+        let call_args = args("desktop-frame-spelling");
+        let id = publish_in(&service, &call_args, &frame_at(0));
+        let upper = format!("capture_{}", id["capture_".len()..].to_uppercase());
+        assert_ne!(upper, id);
+
+        assert_eq!(
+            admit_in(&service, &call_args, &upper, &frame_at(0)).unwrap(),
+            (960.0, 360.0)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recorded_desktop_captures_keep_their_lookup_codes() {
+        let _table = FRAME_TABLE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let layout = frame_at(-1920);
+        let changed = frame_at(0);
+
+        // Evicted by the registry (32 captures by default) while its frame is
+        // still recorded. An expired capture fails the same lookup.
+        let service = CaptureService::default();
+        let call_args = args("desktop-frame-evicted");
+        let evicted = publish_in(&service, &call_args, &layout);
+        for _ in 0..32 {
+            publish_in(&service, &call_args, &layout);
+        }
+        assert!(desktop_capture_frames()
+            .iter()
+            .any(|(recorded, _)| recorded.to_string() == evicted));
+        assert_eq!(
+            refusal_code(admit_in(&service, &call_args, &evicted, &changed)),
+            "capture_not_found"
+        );
+
+        // Retired with its session (retiring removes the capture), and
+        // presented by another session.
+        let service = CaptureService::default();
+        let call_args = args("desktop-frame-retired");
+        let retired = publish_in(&service, &call_args, &layout);
+        service.retire_session(&service.binding_from_args(&call_args).unwrap());
+        assert_eq!(
+            refusal_code(admit_in(&service, &call_args, &retired, &changed)),
+            "capture_not_found"
+        );
+        let foreign = publish_in(&service, &args("desktop-frame-owner"), &layout);
+        assert_eq!(
+            refusal_code(admit_in(&service, &call_args, &foreign, &changed)),
+            "capture_generation_mismatch"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unrecorded_desktop_captures_are_refused_without_being_consumed() {
+        let _table = FRAME_TABLE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let service = CaptureService::default();
+        let call_args = args("desktop-frame-codes");
+        let current = frame_at(0);
+
+        assert_eq!(
+            refusal_code(admit_in(&service, &call_args, "not-a-capture", &current)),
+            "capture_id_invalid"
+        );
+        let window =
+            publish_window(&service, &call_args, &png(4, 3, 0x52), 5, 6, (4, 3), (4, 3)).unwrap();
+        assert_eq!(
+            refusal_code(admit_in(&service, &call_args, &window, &current)),
+            "capture_target_mismatch"
+        );
+
+        // A desktop capture with no recorded frame cannot be checked against
+        // the current layout, so it is refused before admission consumes it.
+        let unrecorded = publish_desktop(
+            &service,
+            &call_args,
+            &png(4, 3, 0x54),
+            (4, 3),
+            (current.width, current.height),
+        )
+        .unwrap();
+        let refusal = admit_in(&service, &call_args, &unrecorded, &current).unwrap_err();
+        assert_eq!(admission_error_code(&refusal), "capture_frame_mismatch");
+        assert!(
+            refusal
+                .to_string()
+                .contains("no recorded Hyprland desktop frame"),
+            "{refusal}"
+        );
+        assert!(service
+            .read_for_perception(
+                service.parse_capture_id(&unrecorded).unwrap(),
+                &service.binding_from_args(&call_args).unwrap(),
+            )
+            .is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_desktop_frame_table_forgets_the_oldest_captures() {
+        let _table = FRAME_TABLE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let id = |i: usize| format!("capture_{}_{i:016x}", "ab".repeat(16));
+        for i in 0..(REMEMBERED_DESKTOP_CAPTURES + 5) {
+            remember_desktop_frame(&id(i), frame_at(0)).unwrap();
+        }
+        let frames = desktop_capture_frames();
+        assert_eq!(frames.len(), REMEMBERED_DESKTOP_CAPTURES);
+        assert_eq!(frames.front().unwrap().0.to_string(), id(5));
+        drop(frames);
+        desktop_capture_frames().clear();
+        assert!(remember_desktop_frame("not-a-capture", frame_at(0)).is_err());
+    }
 
     fn png(width: u32, height: u32, value: u8) -> Vec<u8> {
         let rgba = vec![value; (width * height * 4) as usize];
