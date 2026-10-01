@@ -127,15 +127,41 @@ pub(crate) fn overlay_may_show_pixels() -> bool {
         .is_some_and(|last| last.elapsed() < OVERLAY_CLEAR_GRACE)
 }
 
+/// Whether a cursor at `pos` is drawn by the macOS overlay, which covers only
+/// the main screen from (0, 0). A cursor placed on a display left of or above
+/// it is not drawn here at all, session badge included, so this one predicate
+/// decides both painting and pixel presence.
+fn on_main_screen(pos: (f64, f64)) -> bool {
+    pos.0 > -50.0 && pos.1 > -50.0
+}
+
 fn cursor_may_paint(state: &RenderState) -> bool {
     state.focus_rect.is_some()
         || (state.core.cfg.enabled
             && state.core.visible
             && state.core.idle_alpha > 0.0
-            // The macOS overlay paints only the main screen from (0, 0), so a
-            // cursor placed at negative X paints nothing here.
-            && state.core.pos.0 > -50.0
-            && state.core.pos.1 > -50.0)
+            && on_main_screen(state.core.pos))
+}
+
+/// Paint every cursor the main-screen overlay draws into `pm`.
+fn paint_main_screen(pm: &mut tiny_skia::Pixmap, map: &RenderMap, backing_scale: f32) {
+    for rs in map.cursors.values() {
+        if !on_main_screen(rs.core.pos) {
+            continue;
+        }
+        let focus = rs.focus_rect.map(|rect| FocusRect {
+            rect,
+            t: rs.focus_rect_t,
+        });
+        cursor_overlay::paint_cursor(
+            pm,
+            &rs.core,
+            0.0,
+            0.0, // macOS uses screen-local coords (no origin offset)
+            focus,
+            backing_scale,
+        );
+    }
 }
 
 /// Screen-global geometry kept beside the shared keyed render map
@@ -849,20 +875,7 @@ fn render_loop(
                         .unwrap_or_else(|| tiny_skia::Pixmap::new(1, 1).unwrap());
                     let backing_scale_f32 = scale as f32;
                     note_overlay_frame(map.cursors.values().any(cursor_may_paint));
-                    for (_k, rs) in &map.cursors {
-                        let focus = rs.focus_rect.map(|rect| FocusRect {
-                            rect,
-                            t: rs.focus_rect_t,
-                        });
-                        cursor_overlay::paint_cursor(
-                            &mut pm,
-                            &rs.core,
-                            0.0,
-                            0.0, // macOS uses screen-local coords (no origin offset)
-                            focus,
-                            backing_scale_f32,
-                        );
-                    }
+                    paint_main_screen(&mut pm, map, backing_scale_f32);
                     pm
                 } else {
                     break;
@@ -900,9 +913,7 @@ fn hardware_cursor_position() -> Option<(f64, f64)> {
 fn cursor_is_externally_visible(state: &RenderState) -> bool {
     state.core.cfg.enabled
         && state.core.visible
-        // Visible means painted on the main-screen overlay, which starts at (0, 0).
-        && state.core.pos.0 > -50.0
-        && state.core.pos.1 > -50.0
+        && on_main_screen(state.core.pos)
         && state.core.idle_alpha >= 0.004
 }
 
@@ -1283,6 +1294,27 @@ mod tests {
         assert!(cursor_is_externally_visible(&map.cursors["sessA"]));
 
         map.cursors.get_mut("sessA").unwrap().core.cfg.enabled = false;
+        assert!(!cursor_is_externally_visible(&map.cursors["sessA"]));
+    }
+
+    #[test]
+    fn a_cursor_left_of_the_main_screen_paints_nothing_there() {
+        let mut map = empty_map();
+        let state = placed(&mut map, "sessA");
+        state.core.session_label = Some("A".to_owned());
+        let painted = |map: &RenderMap| {
+            let mut pm = tiny_skia::Pixmap::new(100, 100).unwrap();
+            paint_main_screen(&mut pm, map, 1.0);
+            pm.pixels().iter().any(|pixel| pixel.alpha() > 0)
+        };
+        assert!(painted(&map));
+        assert!(cursor_may_paint(&map.cursors["sessA"]));
+
+        // Placed on a display left of the main screen: the label would clamp
+        // its badge into the main-screen pixmap if this cursor were painted.
+        map.cursors.get_mut("sessA").unwrap().core.pos = (-200.0, 30.0);
+        assert!(!painted(&map));
+        assert!(!cursor_may_paint(&map.cursors["sessA"]));
         assert!(!cursor_is_externally_visible(&map.cursors["sessA"]));
     }
 
